@@ -116,8 +116,16 @@ func TestBracketedPasteBuffersNewlinesWithoutRouting(t *testing.T) {
 
 func TestBareEscapeClearsBufferAndState(t *testing.T) {
 	it, r := newTestInterceptor(t)
-	// A lone ESC ending the chunk is a bare Escape keypress.
+	// A lone ESC ending the chunk is ambiguous: the input loop waits
+	// EscFlushTimeout and, with no continuation, resolves it via FlushEscape
+	// as a bare Escape keypress.
 	if err := it.HandleInput([]byte("abc\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	if !it.PendingEscape() {
+		t.Fatal("lone trailing ESC must be held pending")
+	}
+	if err := it.FlushEscape(); err != nil {
 		t.Fatal(err)
 	}
 	if len(it.buf) != 0 {
@@ -136,6 +144,53 @@ func TestBareEscapeClearsBufferAndState(t *testing.T) {
 	}
 	if got := readAvailable(t, r); got != "abc\x1b/help" {
 		t.Fatalf("forwarded %q", got)
+	}
+}
+
+func TestSplitDeviceReplyAcrossChunks(t *testing.T) {
+	it, r := newTestInterceptor(t)
+	// Terminal replies can be split across reads with the ESC alone in the
+	// first chunk (seen live: OSC 10 color reply and CSI cursor-position
+	// report rendered as "]10;rgb:…" / "[38;1R" in the child's input box).
+	// The continuation arrives before any flush, so the sequence must be
+	// reassembled — not treated as Escape + literal text.
+	if err := it.HandleInput([]byte("\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.HandleInput([]byte("]10;rgb:3838/3a3a/4242\x1b\\")); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.HandleInput([]byte("\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.HandleInput([]byte("[38;1R")); err != nil {
+		t.Fatal(err)
+	}
+	if len(it.buf) != 0 {
+		t.Fatalf("buffer polluted with %q", it.buf)
+	}
+	if it.PendingEscape() {
+		t.Fatal("sequences should be complete")
+	}
+	want := "\x1b]10;rgb:3838/3a3a/4242\x1b\\\x1b[38;1R"
+	if got := readAvailable(t, r); got != want {
+		t.Fatalf("forwarded %q, want %q", got, want)
+	}
+}
+
+func TestEscapeSequenceForwardedInOneWrite(t *testing.T) {
+	it, r := newTestInterceptor(t)
+	// The whole sequence must reach the child in a single write: its parser
+	// treats a lone ESC followed by a pause as the Escape key and renders
+	// the remainder as literal text.
+	if err := it.HandleInput([]byte("\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.HandleInput([]byte("[38;1R")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAvailable(t, r); got != "\x1b[38;1R" {
+		t.Fatalf("first read = %q, want the whole sequence at once", got)
 	}
 }
 

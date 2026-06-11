@@ -46,8 +46,19 @@ type Interceptor struct {
 	passThruLine bool // slash command: forward until Enter without routing
 	pasteMode    bool // inside a bracketed paste (CSI 200~ … CSI 201~)
 	esc          escState
+	escSeq       []byte // escape sequence bytes held until the sequence completes
 	csiParams    []byte
 }
+
+// maxEscSeq bounds the held escape sequence; longer ones (e.g. OSC 52
+// clipboard payloads) are forwarded in segments while the parse continues.
+const maxEscSeq = 4096
+
+// EscFlushTimeout is how long the input loop waits for the continuation of
+// an escape sequence left incomplete at a chunk boundary before treating it
+// as a bare Escape keypress. Terminal replies and key sequences arrive in
+// one burst — only a human Escape produces a lone ESC followed by silence.
+const EscFlushTimeout = 50 * time.Millisecond
 
 // escState tracks progress through an escape sequence so its bytes bypass
 // the prompt buffer. Terminal replies to the child's queries (cursor
@@ -73,28 +84,59 @@ func NewInterceptor(ptmx *os.File, target string, ad adapter.Adapter, rt *router
 	}
 }
 
-// HandleInput processes a chunk of raw stdin bytes.
+// HandleInput processes a chunk of raw stdin bytes. If it leaves an escape
+// sequence incomplete (PendingEscape), the caller must either feed the next
+// chunk or call FlushEscape after EscFlushTimeout of silence.
 func (it *Interceptor) HandleInput(chunk []byte) error {
 	for i := 0; i < len(chunk); i++ {
 		if err := it.handleByte(chunk[i]); err != nil {
 			return err
 		}
 	}
-	// A lone ESC at the end of a chunk is a bare Escape keypress, not the
-	// start of a sequence (terminals send sequences in one burst). Both
-	// claude and codex clear pending input on Escape; mirror that.
-	if it.esc == escIntro {
-		it.esc = escNone
-		it.buf = it.buf[:0]
-	}
 	return nil
 }
 
+// PendingEscape reports whether an escape sequence is held incomplete at a
+// chunk boundary — terminal replies (cursor position, color queries) can be
+// split across reads, so the introducer alone is not enough to decide
+// between "sequence start" and "bare Escape keypress".
+func (it *Interceptor) PendingEscape() bool {
+	return it.esc != escNone
+}
+
+// FlushEscape resolves an escape sequence that never got its continuation:
+// a lone ESC was a bare Escape keypress — both claude and codex clear
+// pending input on Escape, so the shadow buffer is cleared to mirror that —
+// and a longer prefix is forwarded as-is.
+func (it *Interceptor) FlushEscape() error {
+	if it.esc == escNone {
+		return nil
+	}
+	bare := it.esc == escIntro
+	it.esc = escNone
+	seq := it.escSeq
+	it.escSeq = nil
+	if bare {
+		it.buf = it.buf[:0]
+		it.passThruLine = false
+	}
+	return it.writePTY(seq)
+}
+
 func (it *Interceptor) handleByte(b byte) error {
-	// Escape sequences bypass the buffer entirely.
+	// Escape sequence bytes bypass the buffer and are held until the
+	// sequence completes, then forwarded in a single write: the child's own
+	// input parser would misread a sequence split across writes (a lone ESC
+	// followed by a pause renders the rest as literal text).
 	if it.esc != escNone {
+		it.escSeq = append(it.escSeq, b)
 		it.advanceEscape(b)
-		return it.writePTY([]byte{b})
+		if it.esc == escNone || len(it.escSeq) >= maxEscSeq {
+			seq := it.escSeq
+			it.escSeq = it.escSeq[:0]
+			return it.writePTY(seq)
+		}
+		return nil
 	}
 
 	// Slash-command line: forward as-is until Enter, skipping routing.
@@ -115,7 +157,8 @@ func (it *Interceptor) handleByte(b byte) error {
 	switch {
 	case b == 0x1b:
 		it.esc = escIntro
-		return it.writePTY([]byte{b})
+		it.escSeq = append(it.escSeq[:0], b)
+		return nil
 
 	case isEnter(b):
 		return it.handleEnter()

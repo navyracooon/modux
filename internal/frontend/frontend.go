@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/term"
@@ -60,21 +61,47 @@ func Run(cfg *config.Config, target string, args []string) (int, error) {
 	it := NewInterceptor(ptmx, target, ad, rt, mon)
 
 	// Stdin → interceptor. Bytes typed while a submission is in flight stay
-	// in the OS stdin buffer until the interceptor returns (input queueing).
+	// queued (in the channel and the OS stdin buffer) until the interceptor
+	// returns. The quiet-period timer resolves escape sequences split across
+	// reads: a lone ESC with no continuation is a bare Escape keypress,
+	// while a terminal reply's remainder simply continues the sequence.
+	chunks := make(chan []byte)
 	go func() {
+		defer close(chunks)
 		buf := make([]byte, 4096)
 		for {
 			n, rerr := os.Stdin.Read(buf)
 			if n > 0 {
-				if werr := it.HandleInput(buf[:n]); werr != nil {
-					return
-				}
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				chunks <- chunk
 			}
 			if rerr != nil {
 				if rerr != io.EOF {
 					fmt.Fprintf(os.Stderr, "\r\n[modux] stdin error: %v\r\n", rerr)
 				}
 				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			var quiet <-chan time.Time
+			if it.PendingEscape() {
+				quiet = time.After(EscFlushTimeout)
+			}
+			select {
+			case chunk, ok := <-chunks:
+				if !ok {
+					return
+				}
+				if err := it.HandleInput(chunk); err != nil {
+					return
+				}
+			case <-quiet:
+				if err := it.FlushEscape(); err != nil {
+					return
+				}
 			}
 		}
 	}()
