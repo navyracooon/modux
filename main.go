@@ -3,97 +3,55 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/exec"
 
 	"github.com/navyracooon/modux/internal/config"
-	"github.com/navyracooon/modux/internal/terminal"
+	"github.com/navyracooon/modux/internal/frontend"
 )
 
 const usage = `modux — model-optimizing wrapper for claude and codex
 
 Usage:
-  modux                    Launch using saved config (runs setup on first use)
-  modux claude [args...]   Run claude with automatic model selection
-  modux codex  [args...]   Run codex with automatic model selection
-  modux config             Re-run the interactive setup wizard
+  modux claude [args...]   Run Claude Code with automatic model selection
+  modux codex  [args...]   Run Codex CLI with automatic model selection
 
-Environment variables:
-  ANTHROPIC_API_KEY        Required for claude and the classifier
-  OPENAI_API_KEY           Required for codex
-  MODUX_CLASSIFIER_MODEL   Override the classifier model
+Remaining arguments are forwarded to the child CLI unchanged.
+
+Configuration: ~/.config/modux/config.toml
+Routing uses the wrapped CLI itself in headless mode, so the CLI's
+existing authentication is reused — no separate API key is needed.
 `
 
 func main() {
-	// No args → use saved config, or run setup if first time.
 	if len(os.Args) < 2 {
-		runWithSavedConfig()
-		return
+		fmt.Print(usage)
+		os.Exit(1)
 	}
 
 	switch os.Args[1] {
-	case "config":
-		if _, err := config.RunSetup(); err != nil {
-			fmt.Fprintf(os.Stderr, "setup failed: %v\n", err)
-			os.Exit(1)
-		}
+	case "-h", "--help", "help":
+		fmt.Print(usage)
 		return
 
 	case "claude", "codex":
 		target := os.Args[1]
-		if _, err := findBinary(target); err != nil {
+		if _, err := exec.LookPath(target); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s not found in PATH\n", target)
 			os.Exit(1)
 		}
-		cfg := config.Load(target, os.Args[2:])
-		run(cfg)
-
-	case "-h", "--help", "help":
-		fmt.Print(usage)
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		code, err := frontend.Run(cfg, target, os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "modux: %v\n", err)
+		}
+		os.Exit(code)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
 		os.Exit(1)
 	}
-}
-
-func runWithSavedConfig() {
-	saved := config.LoadFile()
-	if saved == nil {
-		// First run — prompt for setup.
-		var err error
-		saved, err = config.RunSetup()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "setup failed: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if _, err := findBinary(saved.Target); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s not found in PATH\n", saved.Target)
-		os.Exit(1)
-	}
-
-	cfg := config.Load(saved.Target, nil)
-	run(cfg)
-}
-
-func run(cfg *config.Config) {
-	if cfg.AnthropicAPIKey == "" {
-		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY not set (required for the classifier)")
-		os.Exit(1)
-	}
-	if err := terminal.Run(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "modux: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func findBinary(name string) (string, error) {
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		p := filepath.Join(dir, name)
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("%s not found", name)
 }

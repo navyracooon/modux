@@ -1,40 +1,87 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
+// Config is the persisted user configuration loaded from
+// ~/.config/modux/config.toml.
 type Config struct {
-	Target          string
-	Args            []string
-	ClassifierModel string
-	AnthropicAPIKey string
-	OpenAIAPIKey    string
+	Classifier Classifier                   `toml:"classifier"`
+	Models     map[string]map[string]string `toml:"models"`
 }
 
-// Load builds a runtime Config from saved file + env overrides.
-// target/args can be empty strings to signal "use saved config".
-func Load(target string, args []string) *Config {
-	saved := LoadFile()
+// Classifier configures the routing model.
+type Classifier struct {
+	Model   string `toml:"model"`
+	Timeout int    `toml:"timeout"` // milliseconds
+}
 
-	// Resolve target: explicit arg > saved config > ""
-	if target == "" && saved != nil {
-		target = saved.Target
-	}
+// TimeoutDuration returns the classifier timeout as a time.Duration.
+func (c Classifier) TimeoutDuration() time.Duration {
+	return time.Duration(c.Timeout) * time.Millisecond
+}
 
-	classifierModel := os.Getenv("MODUX_CLASSIFIER_MODEL")
-	if classifierModel == "" && saved != nil {
-		classifierModel = saved.ClassifierModel
-	}
-	if classifierModel == "" {
-		classifierModel = "claude-haiku-4-5-20251001"
-	}
-
+func defaultConfig() *Config {
 	return &Config{
-		Target:          target,
-		Args:            args,
-		ClassifierModel: classifierModel,
-		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
+		Classifier: Classifier{
+			Model:   "claude-haiku-4-5-20251001",
+			Timeout: 3000,
+		},
+		Models: map[string]map[string]string{
+			"claude": {
+				"haiku":  "claude-haiku-4-5-20251001",
+				"sonnet": "claude-sonnet-4-6",
+				"opus":   "claude-opus-4-6",
+			},
+			"codex": {
+				"mini": "gpt-5.4-mini",
+				"full": "gpt-5.5",
+			},
+		},
 	}
+}
+
+// Path returns the config file location.
+func Path() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "modux", "config.toml")
+}
+
+// Load reads the config file, falling back to defaults for anything unset.
+// A missing file is not an error; a malformed file is.
+func Load() (*Config, error) {
+	cfg := defaultConfig()
+
+	data, err := os.ReadFile(Path())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", Path(), err)
+	}
+
+	var file Config
+	if err := toml.Unmarshal(data, &file); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", Path(), err)
+	}
+
+	if file.Classifier.Model != "" {
+		cfg.Classifier.Model = file.Classifier.Model
+	}
+	if file.Classifier.Timeout > 0 {
+		cfg.Classifier.Timeout = file.Classifier.Timeout
+	}
+	for target, models := range file.Models {
+		if len(models) > 0 {
+			cfg.Models[target] = models
+		}
+	}
+
+	return cfg, nil
 }
