@@ -24,7 +24,11 @@ func Run(cfg *config.Config, target string, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	rt := router.New(cfg.Classifier.Model, cfg.Classifier.TimeoutDuration())
+	// Each target classifies via its own vendor's CLI by default; the session
+	// prewarms in the background while the user types their first prompt.
+	rt := router.New(cfg.ClassifierModel(target), cfg.Classifier.TimeoutDuration())
+	rt.Prewarm()
+	defer rt.Close()
 
 	c := exec.Command(target, args...)
 	ptmx, err := pty.Start(c)

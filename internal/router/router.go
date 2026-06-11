@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,12 +20,17 @@ const (
 // Router asks a lightweight classifier model which model alias should handle
 // a prompt, based on the prompt and a summary of recent history.
 //
-// The classifier call reuses the wrapped CLI itself in headless mode
-// (`claude -p` / `codex exec`), so the user's existing CLI authentication is
-// used and no separate API key is required.
+// The classifier reuses the model vendor's own CLI in a persistent headless
+// session, so the user's existing CLI authentication is used — no separate
+// API key, and a codex-only subscription is enough for `modux codex`. The
+// session is created lazily; call Prewarm at startup so it warms while the
+// user types their first prompt.
 type Router struct {
 	model   string
 	timeout time.Duration
+
+	clsOnce sync.Once
+	cls     classifier
 
 	history []string
 }
@@ -36,32 +42,66 @@ func New(model string, timeout time.Duration) *Router {
 	}
 }
 
+func (r *Router) classifier() classifier {
+	r.clsOnce.Do(func() { r.cls = newClassifier(r.model) })
+	return r.cls
+}
+
+// Prewarm starts the persistent classifier session in the background.
+func (r *Router) Prewarm() {
+	r.classifier()
+}
+
+// Ready reports whether the classifier session has finished warming up;
+// while false, a classification will work but pays cold-start latency.
+func (r *Router) Ready() bool {
+	return r.classifier().ready()
+}
+
+// Close terminates the persistent classifier session, if any.
+func (r *Router) Close() {
+	if r.cls != nil {
+		r.cls.close()
+	}
+}
+
+// warmupWaitMax caps how long Route waits for a still-initializing classifier
+// session before giving up on warm state and racing the timeout anyway.
+const warmupWaitMax = 60 * time.Second
+
+// AwaitReady blocks until the classifier session is warm or ctx expires.
+func (r *Router) AwaitReady(ctx context.Context) {
+	r.classifier().awaitReady(ctx)
+}
+
 // Route classifies the prompt and returns the chosen alias from aliases.
 // On timeout or any error it returns an error; the caller keeps the current
 // model and forwards the prompt as-is.
 func (r *Router) Route(ctx context.Context, target string, aliases map[string]string, prompt string) (string, error) {
+	// A still-warming session is a one-time startup cost, not a slow
+	// classification — wait it out before starting the timeout clock.
+	warmCtx, cancelWarm := context.WithTimeout(ctx, warmupWaitMax)
+	r.classifier().awaitReady(warmCtx)
+	cancelWarm()
+
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	names := aliasNames(aliases)
 	full := instructions(target, names) + "\n\n" + r.userPrompt(prompt)
 
-	cmd := classifierCommand(ctx, r.model, full)
-	out, err := cmd.Output()
+	out, err := r.classifier().ask(ctx, full)
 	if os.Getenv("MODUX_DEBUG") != "" {
-		logClassifierOutput(prompt, out, err)
+		logClassifierOutput(prompt, []byte(out), err)
 	}
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("classifier timed out after %s", r.timeout)
 		}
-		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
-			return "", fmt.Errorf("classifier failed: %s", firstLine(string(exitErr.Stderr)))
-		}
-		return "", fmt.Errorf("classifier failed: %w", err)
+		return "", err
 	}
 
-	alias, ok := parseAlias(string(out), names)
+	alias, ok := parseAlias(out, names)
 	if !ok {
 		return "", fmt.Errorf("classifier returned no known alias")
 	}
@@ -81,22 +121,6 @@ func logClassifierOutput(prompt string, out []byte, runErr error) {
 			fmt.Fprintf(f, "stderr: %q\n", exitErr.Stderr)
 		}
 	}
-}
-
-// classifierCommand builds the headless CLI invocation for the classifier.
-// The CLI is chosen by the classifier model's vendor, independent of the
-// wrapped tool: a Claude model always runs through `claude -p` (a few
-// seconds), while `codex exec` spins up a full agent session and takes tens
-// of seconds — only used when the classifier model itself is a Codex one.
-func classifierCommand(ctx context.Context, model, prompt string) *exec.Cmd {
-	if strings.HasPrefix(model, "claude") {
-		// --strict-mcp-config skips MCP server loading for a faster start.
-		return exec.CommandContext(ctx, "claude", "-p", "--model", model, "--strict-mcp-config", prompt)
-	}
-	// Disable MCP servers and force low reasoning effort to keep the call as
-	// fast as codex exec allows.
-	return exec.CommandContext(ctx, "codex", "exec", "--skip-git-repo-check",
-		"-c", "mcp_servers={}", "-c", `model_reasoning_effort="low"`, "-m", model, prompt)
 }
 
 // parseAlias extracts the chosen alias from the classifier output. The answer

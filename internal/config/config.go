@@ -16,10 +16,14 @@ type Config struct {
 	Models     map[string]map[string]string `toml:"models"`
 }
 
-// Classifier configures the routing model.
+// Classifier configures the routing model. Each wrapped tool classifies with
+// its own vendor's model by default, so a codex-only user never needs a
+// claude installation (and vice versa). `model` is a global override applied
+// to every target; `[classifier.models]` entries override per target.
 type Classifier struct {
-	Model   string `toml:"model"`
-	Timeout int    `toml:"timeout"` // milliseconds
+	Model   string            `toml:"model"`
+	Models  map[string]string `toml:"models"`
+	Timeout int               `toml:"timeout"` // milliseconds
 }
 
 // TimeoutDuration returns the classifier timeout as a time.Duration.
@@ -27,11 +31,28 @@ func (c Classifier) TimeoutDuration() time.Duration {
 	return time.Duration(c.Timeout) * time.Millisecond
 }
 
+// ClassifierModel resolves the classifier model for a target tool:
+// [classifier.models] entry → global classifier.model → built-in default.
+func (c *Config) ClassifierModel(target string) string {
+	if m := c.Classifier.Models[target]; m != "" {
+		return m
+	}
+	if c.Classifier.Model != "" {
+		return c.Classifier.Model
+	}
+	return "claude-haiku-4-5-20251001"
+}
+
 func defaultConfig() *Config {
 	return &Config{
 		Classifier: Classifier{
-			Model:   "claude-haiku-4-5-20251001",
-			Timeout: 3000,
+			Models: map[string]string{
+				"claude": "claude-haiku-4-5-20251001",
+				"codex":  "gpt-5.4-mini",
+			},
+			// Generous default: a codex classification is ~4s warm and
+			// ~12s on the very first (still-initializing) call.
+			Timeout: 15000,
 		},
 		Models: map[string]map[string]string{
 			"claude": {
@@ -72,7 +93,15 @@ func Load() (*Config, error) {
 	}
 
 	if file.Classifier.Model != "" {
+		// An explicit global model replaces the built-in per-target defaults;
+		// explicit [classifier.models] entries below still win per target.
 		cfg.Classifier.Model = file.Classifier.Model
+		cfg.Classifier.Models = map[string]string{}
+	}
+	for target, model := range file.Classifier.Models {
+		if model != "" {
+			cfg.Classifier.Models[target] = model
+		}
 	}
 	if file.Classifier.Timeout > 0 {
 		cfg.Classifier.Timeout = file.Classifier.Timeout

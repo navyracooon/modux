@@ -159,7 +159,23 @@ func (it *Interceptor) handleEnter() error {
 	// ROUTING: ask the classifier which model should handle this prompt.
 	// The spinner gives immediate feedback that the Enter was accepted.
 	it.state = stateRouting
-	spinner := startSpinner(os.Stderr, terminalRows(), "Classifying…")
+	msg := "Classifying…"
+	warming := !it.router.Ready()
+	if warming {
+		// The classifier session is still warming up. Route waits for it
+		// (the wait is excluded from the classification timeout), so tell
+		// the user why this first submission takes longer.
+		msg = "Initializing classifier…"
+	}
+	spinner := startSpinner(os.Stderr, terminalRows(), msg)
+	if warming {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			it.router.AwaitReady(ctx)
+			spinner.SetMessage("Classifying…")
+		}()
+	}
 	alias, err := it.router.Route(context.Background(), it.target, it.adapter.Models(), prompt)
 	it.router.Remember(prompt)
 

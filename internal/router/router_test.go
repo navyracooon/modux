@@ -1,8 +1,6 @@
 package router
 
 import (
-	"context"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -50,17 +48,6 @@ func TestAliasNamesOrderedCheapestFirst(t *testing.T) {
 	})
 	if !reflect.DeepEqual(names, []string{"haiku", "sonnet", "opus"}) {
 		t.Fatalf("aliasNames = %v", names)
-	}
-}
-
-func TestClassifierCommandPicksCLIByModelVendor(t *testing.T) {
-	cmd := classifierCommand(context.Background(), "claude-haiku-4-5-20251001", "p")
-	if filepath.Base(cmd.Args[0]) != "claude" {
-		t.Fatalf("claude model should run via claude CLI, got %v", cmd.Args)
-	}
-	cmd = classifierCommand(context.Background(), "gpt-5.4-mini", "p")
-	if filepath.Base(cmd.Args[0]) != "codex" {
-		t.Fatalf("gpt model should run via codex CLI, got %v", cmd.Args)
 	}
 }
 
