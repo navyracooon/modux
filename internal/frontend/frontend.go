@@ -62,15 +62,30 @@ func Run(cfg *config.Config, target string, args []string) (int, error) {
 
 	// Stdin → interceptor. Bytes typed while a submission is in flight stay
 	// queued (in the channel and the OS stdin buffer) until the interceptor
-	// returns. The quiet-period timer resolves escape sequences split across
-	// reads: a lone ESC with no continuation is a bare Escape keypress,
-	// while a terminal reply's remainder simply continues the sequence.
+	// returns.
+	go pumpInput(readChunks(os.Stdin), it)
+
+	// Wait for child exit (PTY EOF), then collect its status.
+	<-mon.EOF()
+	err = c.Wait()
+	if err == nil {
+		return 0, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode(), nil
+	}
+	return 1, err
+}
+
+// readChunks pumps reads from r into a channel of owned chunks, closing it
+// on EOF or error.
+func readChunks(r io.Reader) <-chan []byte {
 	chunks := make(chan []byte)
 	go func() {
 		defer close(chunks)
 		buf := make([]byte, 4096)
 		for {
-			n, rerr := os.Stdin.Read(buf)
+			n, rerr := r.Read(buf)
 			if n > 0 {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
@@ -84,36 +99,32 @@ func Run(cfg *config.Config, target string, args []string) (int, error) {
 			}
 		}
 	}()
-	go func() {
-		for {
-			var quiet <-chan time.Time
-			if it.PendingEscape() {
-				quiet = time.After(EscFlushTimeout)
+	return chunks
+}
+
+// pumpInput feeds chunks to the interceptor until the channel closes or a
+// PTY write fails. The quiet-period timer resolves escape sequences split
+// across reads: a lone ESC with no continuation within EscFlushTimeout is a
+// bare Escape keypress, while a terminal reply's remainder that does arrive
+// simply continues the sequence.
+func pumpInput(chunks <-chan []byte, it *Interceptor) {
+	for {
+		var quiet <-chan time.Time
+		if it.PendingEscape() {
+			quiet = time.After(EscFlushTimeout)
+		}
+		select {
+		case chunk, ok := <-chunks:
+			if !ok {
+				return
 			}
-			select {
-			case chunk, ok := <-chunks:
-				if !ok {
-					return
-				}
-				if err := it.HandleInput(chunk); err != nil {
-					return
-				}
-			case <-quiet:
-				if err := it.FlushEscape(); err != nil {
-					return
-				}
+			if err := it.HandleInput(chunk); err != nil {
+				return
+			}
+		case <-quiet:
+			if err := it.FlushEscape(); err != nil {
+				return
 			}
 		}
-	}()
-
-	// Wait for child exit (PTY EOF), then collect its status.
-	<-mon.EOF()
-	err = c.Wait()
-	if err == nil {
-		return 0, nil
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return exitErr.ExitCode(), nil
-	}
-	return 1, err
 }

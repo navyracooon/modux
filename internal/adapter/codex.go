@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"regexp"
@@ -15,7 +16,13 @@ var (
 	codexEffortScreenRE = regexp.MustCompile(`Select\s*Reasoning\s*Level`)
 )
 
-const codexPickerTimeout = 3 * time.Second
+const (
+	codexPickerTimeout = 3 * time.Second
+
+	// codexBusyMarker is Codex's rejection notice when /model is issued
+	// while a task is still generating.
+	codexBusyMarker = "disabled while a task is in progress"
+)
 
 // CodexAdapter switches models in Codex CLI. Codex's /model does not accept
 // an argument (a "/model name" line is sent to the LLM as chat), so the
@@ -52,6 +59,12 @@ func (a *CodexAdapter) SwitchModel(ptmx *os.File, model string) error {
 	}, codexPickerTimeout)
 	if !ok {
 		debugDump("codex-picker", out)
+		if bytes.Contains(stripANSI(out), []byte(codexBusyMarker)) {
+			// Codex rejects /model while it is generating. No picker opened,
+			// so there is nothing to Esc out of — and Esc would cancel the
+			// running task. The forwarded prompt queues behind it instead.
+			return fmt.Errorf("codex is busy with the previous task")
+		}
 		_, _ = ptmx.Write([]byte{0x1b})
 		return fmt.Errorf("model %s not offered by the picker", model)
 	}

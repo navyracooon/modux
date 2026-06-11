@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -8,9 +9,11 @@ import (
 
 const matchBufMax = 64 * 1024
 
-// Monitor forwards PTY output to the user's stdout untouched, while
+// Monitor forwards PTY output to the user's terminal untouched, while
 // optionally matching switch-completion patterns on the same stream.
 type Monitor struct {
+	out io.Writer // forwarding target; os.Stdout outside tests
+
 	mu     sync.Mutex
 	detect func([]byte) bool
 	buf    []byte
@@ -21,11 +24,11 @@ type Monitor struct {
 }
 
 func NewMonitor() *Monitor {
-	return &Monitor{eof: make(chan struct{})}
+	return &Monitor{out: os.Stdout, eof: make(chan struct{})}
 }
 
-// Run pumps PTY output to stdout until the PTY closes (child exit).
-func (m *Monitor) Run(ptmx *os.File) {
+// Run pumps PTY output to the terminal until the PTY closes (child exit).
+func (m *Monitor) Run(ptmx io.Reader) {
 	defer m.eofOnce.Do(func() { close(m.eof) })
 
 	buf := make([]byte, 4096)
@@ -33,7 +36,7 @@ func (m *Monitor) Run(ptmx *os.File) {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			_, _ = os.Stdout.Write(chunk)
+			_, _ = m.out.Write(chunk)
 			m.feed(chunk)
 		}
 		if err != nil {

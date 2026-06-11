@@ -1,8 +1,11 @@
 package adapter
 
 import (
+	"io"
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestStripANSI(t *testing.T) {
@@ -65,6 +68,91 @@ func TestCodexModelDigit(t *testing.T) {
 	}
 	if _, ok := codexModelDigit(picker, "gpt-9"); ok {
 		t.Error("unknown model must not match")
+	}
+}
+
+// fakeWaiter returns scripted screens in order; WaitFor reports whether the
+// detector matched the screen it returned.
+type fakeWaiter struct {
+	screens [][]byte
+}
+
+func (f *fakeWaiter) WaitFor(detect func([]byte) bool, _ time.Duration) ([]byte, bool) {
+	if len(f.screens) == 0 {
+		return nil, false
+	}
+	s := f.screens[0]
+	f.screens = f.screens[1:]
+	return s, detect(s)
+}
+
+func TestCodexSwitchModelWalksPicker(t *testing.T) {
+	picker := []byte("Select Model and Effort" +
+		"\x1b[26;3H2.\x1b[26;6Hgpt-5.5\x1b[26;31HFrontier model for complex coding.")
+	effort := []byte("Select Reasoning Level\n› 2. high")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	a := &CodexAdapter{output: &fakeWaiter{screens: [][]byte{picker, effort}}}
+	if err := a.SwitchModel(w, "gpt-5.5"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Open the picker, jump to the row by digit, accept the highlighted effort.
+	if want := "/model\r2\r"; string(got) != want {
+		t.Fatalf("keystrokes = %q, want %q", got, want)
+	}
+}
+
+func TestCodexSwitchModelBusyDoesNotEscape(t *testing.T) {
+	// Codex rejects /model while generating. No picker opened, so Esc must
+	// NOT be sent — it would cancel the running task.
+	busy := []byte("\x1b[38;5;1m⚠  '/model' is disabled while a task is in progress.\x1b[39m")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	a := &CodexAdapter{output: &fakeWaiter{screens: [][]byte{busy}}}
+	err = a.SwitchModel(w, "gpt-5.5")
+	if err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("err = %v, want busy", err)
+	}
+	w.Close()
+
+	got, rerr := io.ReadAll(r)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if want := "/model\r"; string(got) != want {
+		t.Fatalf("keystrokes = %q, want %q (no Esc while busy)", got, want)
+	}
+}
+
+func TestCodexSwitchModelRejectsUnknownModel(t *testing.T) {
+	picker := []byte("Select Model and Effort\x1b[26;3H2.\x1b[26;6Hgpt-5.5\x1b[26;31HFrontier")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	a := &CodexAdapter{output: &fakeWaiter{screens: [][]byte{picker}}}
+	if err := a.SwitchModel(w, "gpt-9"); err == nil {
+		t.Fatal("unknown model must fail (and Esc out of the picker)")
 	}
 }
 

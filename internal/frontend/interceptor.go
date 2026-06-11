@@ -2,13 +2,13 @@ package frontend
 
 import (
 	"context"
+	"io"
 	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/navyracooon/modux/internal/adapter"
-	"github.com/navyracooon/modux/internal/router"
 )
 
 // state is the routing state machine:
@@ -23,21 +23,50 @@ const (
 	stateForwarding
 )
 
-const switchDoneTimeout = 5 * time.Second
+// Router is the interceptor's view of the routing engine. *router.Router
+// implements it; tests substitute fakes to drive every routing path.
+type Router interface {
+	Route(ctx context.Context, target string, aliases map[string]string, prompt string) (string, error)
+	Remember(prompt string)
+	Ready() bool
+	AwaitReady(ctx context.Context)
+}
+
+// Timing knobs. Vars rather than consts so tests can shrink them.
+var (
+	switchDoneTimeout = 5 * time.Second
+	routeFailHold     = 1500 * time.Millisecond
+	alreadyActiveHold = 800 * time.Millisecond
+	switchFailHold    = 1500 * time.Millisecond
+)
+
+// maxEscSeq bounds the held escape sequence; longer ones (e.g. OSC 52
+// clipboard payloads) are forwarded in segments while the parse continues.
+const maxEscSeq = 4096
+
+// EscFlushTimeout is how long the input loop waits for the continuation of
+// an escape sequence left incomplete at a chunk boundary before treating it
+// as a bare Escape keypress. Terminal replies and key sequences arrive in
+// one burst — only a human Escape produces a lone ESC followed by silence.
+const EscFlushTimeout = 50 * time.Millisecond
 
 // Interceptor sits between the user's stdin and the child PTY. Keystrokes are
 // echoed to the PTY as they arrive while a shadow buffer tracks the pending
 // prompt; on Enter the buffered prompt is routed before being submitted.
 //
 // Input arriving while a submission is being processed queues naturally: the
-// stdin reader calls HandleInput synchronously and simply does not read more
+// input loop calls HandleInput synchronously and simply does not read more
 // until the ROUTING/SWITCHING/FORWARDING cycle completes.
 type Interceptor struct {
 	ptmx    *os.File
 	target  string
 	adapter adapter.Adapter
-	router  *router.Router
+	router  Router
 	monitor *Monitor
+
+	// statusW and rows place the spinner/status line; injectable for tests.
+	statusW io.Writer
+	rows    func() int
 
 	state        state
 	currentModel string
@@ -49,16 +78,6 @@ type Interceptor struct {
 	escSeq       []byte // escape sequence bytes held until the sequence completes
 	csiParams    []byte
 }
-
-// maxEscSeq bounds the held escape sequence; longer ones (e.g. OSC 52
-// clipboard payloads) are forwarded in segments while the parse continues.
-const maxEscSeq = 4096
-
-// EscFlushTimeout is how long the input loop waits for the continuation of
-// an escape sequence left incomplete at a chunk boundary before treating it
-// as a bare Escape keypress. Terminal replies and key sequences arrive in
-// one burst — only a human Escape produces a lone ESC followed by silence.
-const EscFlushTimeout = 50 * time.Millisecond
 
 // escState tracks progress through an escape sequence so its bytes bypass
 // the prompt buffer. Terminal replies to the child's queries (cursor
@@ -74,13 +93,15 @@ const (
 	escStringEsc          // got ESC inside a string sequence, expecting '\'
 )
 
-func NewInterceptor(ptmx *os.File, target string, ad adapter.Adapter, rt *router.Router, mon *Monitor) *Interceptor {
+func NewInterceptor(ptmx *os.File, target string, ad adapter.Adapter, rt Router, mon *Monitor) *Interceptor {
 	return &Interceptor{
 		ptmx:    ptmx,
 		target:  target,
 		adapter: ad,
 		router:  rt,
 		monitor: mon,
+		statusW: os.Stderr,
+		rows:    terminalRows,
 	}
 }
 
@@ -184,24 +205,43 @@ func (it *Interceptor) handleByte(b byte) error {
 	}
 }
 
-// handleEnter runs the IDLE → ROUTING → SWITCHING → FORWARDING cycle.
+// handleEnter dispatches Enter on the buffered prompt: empty lines and bare
+// digits (picker selections, e.g. Codex's /model list) submit untouched;
+// anything else runs the IDLE → ROUTING → SWITCHING → FORWARDING cycle.
 func (it *Interceptor) handleEnter() error {
 	prompt := string(it.buf)
 	it.buf = it.buf[:0]
 
 	trimmed := strings.TrimSpace(prompt)
-	if trimmed == "" {
-		return it.writePTY([]byte{'\r'})
-	}
-	if isDigits(trimmed) {
-		// Bare digits are picker selections (e.g. Codex's /model list), not
-		// a prompt worth routing; they were already echoed — just submit.
+	if trimmed == "" || isDigits(trimmed) {
 		return it.writePTY([]byte{'\r'})
 	}
 
-	// ROUTING: ask the classifier which model should handle this prompt.
-	// The spinner gives immediate feedback that the Enter was accepted.
 	it.state = stateRouting
+	defer func() { it.state = stateIdle }()
+
+	model, doSwitch := it.decideModel(prompt)
+	if !doSwitch {
+		// Keep the current model; the prompt is already typed into the
+		// child's input box, so a bare Enter submits it.
+		it.state = stateForwarding
+		return it.writePTY([]byte{'\r'})
+	}
+
+	it.state = stateSwitching
+	if err := it.performSwitch(prompt, model); err != nil {
+		return err
+	}
+
+	it.state = stateForwarding
+	return it.forwardPrompt(prompt)
+}
+
+// decideModel classifies the prompt and reports whether a model switch is
+// needed. All routing-phase user feedback (spinner, status lines) happens
+// here; doSwitch == false means "submit on the current model as-is".
+func (it *Interceptor) decideModel(prompt string) (model string, doSwitch bool) {
+	// The spinner gives immediate feedback that the Enter was accepted.
 	msg := "Classifying…"
 	warming := !it.router.Ready()
 	if warming {
@@ -210,7 +250,7 @@ func (it *Interceptor) handleEnter() error {
 		// the user why this first submission takes longer.
 		msg = "Initializing classifier…"
 	}
-	spinner := startSpinner(os.Stderr, terminalRows(), msg)
+	spinner := startSpinner(it.statusW, it.rows(), msg)
 	if warming {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -219,34 +259,33 @@ func (it *Interceptor) handleEnter() error {
 			spinner.SetMessage("Classifying…")
 		}()
 	}
+
 	alias, err := it.router.Route(context.Background(), it.target, it.adapter.Models(), prompt)
 	it.router.Remember(prompt)
 
 	if err != nil {
-		// Timeout or error: keep the current model, forward the prompt as-is.
-		spinner.StopWith(1500*time.Millisecond, "routing failed (%v) — keeping current model", err)
-		it.state = stateForwarding
-		defer func() { it.state = stateIdle }()
-		return it.writePTY([]byte{'\r'})
+		spinner.StopWith(routeFailHold, "routing failed (%v) — keeping current model", err)
+		return "", false
 	}
-
-	model := it.adapter.Models()[alias]
+	model = it.adapter.Models()[alias]
 	if model == it.currentModel {
-		spinner.StopWith(800*time.Millisecond, "model: %s (%s) — already active", alias, model)
-		it.state = stateForwarding
-		defer func() { it.state = stateIdle }()
-		return it.writePTY([]byte{'\r'})
+		spinner.StopWith(alreadyActiveHold, "model: %s (%s) — already active", alias, model)
+		return "", false
 	}
 
 	// Clear the spinner before switching: the child's own /model echo and
-	// "Set model to …" confirmation are the durable record of the decision,
-	// and anything we leave on screen would be shredded by its repaints.
+	// confirmation are the durable record of the decision, and anything we
+	// leave on screen would be shredded by its repaints.
 	spinner.Stop()
+	return model, true
+}
 
-	// SWITCHING: clear the echoed prompt from the child's input line, issue
-	// the switch command, and wait for the completion pattern. The child's
-	// own /model echo and confirmation show the progress from here on.
-	it.state = stateSwitching
+// performSwitch clears the echoed prompt from the child's input line, drives
+// the adapter's switch, and waits for the completion pattern. A switch
+// failure (e.g. the picker did not open) is absorbed: the user stays on the
+// current model and the prompt is still submitted. Only PTY write errors
+// propagate.
+func (it *Interceptor) performSwitch(prompt, model string) error {
 	if err := it.clearChildInput(prompt); err != nil {
 		return err
 	}
@@ -256,33 +295,31 @@ func (it *Interceptor) handleEnter() error {
 	// returns — the confirmation needs a render cycle, so it cannot appear
 	// before the watch is in place.
 	if err := it.adapter.SwitchModel(it.ptmx, model); err != nil {
-		// Switch failed (e.g. picker did not open): stay on the current
-		// model and submit the prompt anyway.
-		transientStatus(os.Stderr, terminalRows(), 1500*time.Millisecond,
+		transientStatus(it.statusW, it.rows(), switchFailHold,
 			"switch failed (%v) — keeping current model", err)
-		it.state = stateForwarding
-		defer func() { it.state = stateIdle }()
 		time.Sleep(adapter.SubmitDelay)
-		return it.forwardPrompt(prompt)
+		return nil
 	}
+	it.awaitSwitchDone()
+	it.currentModel = model
+	return nil
+}
+
+// awaitSwitchDone blocks until the adapter's completion pattern shows up in
+// the child's output, or the timeout passes (the switch is then assumed to
+// have succeeded; the child's own UI is the source of truth either way).
+func (it *Interceptor) awaitSwitchDone() {
 	done := it.monitor.Arm(it.adapter.DetectSwitchDone)
+	defer it.monitor.Disarm()
 	timer := time.NewTimer(switchDoneTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
-		it.currentModel = model
 	case <-timer.C:
 		if os.Getenv("MODUX_DEBUG") != "" {
 			_ = os.WriteFile("/tmp/modux-switch-timeout.bin", it.monitor.Snapshot(), 0o600)
 		}
-		it.currentModel = model
 	}
-	it.monitor.Disarm()
-
-	// FORWARDING: re-send the prompt and submit it.
-	it.state = stateForwarding
-	defer func() { it.state = stateIdle }()
-	return it.forwardPrompt(prompt)
 }
 
 // forwardPrompt re-sends the prompt and submits it. Multi-line prompts are

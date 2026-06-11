@@ -29,6 +29,7 @@ type Router struct {
 	model   string
 	timeout time.Duration
 
+	mkCls   func() classifier // factory; tests inject fakes here
 	clsOnce sync.Once
 	cls     classifier
 
@@ -39,11 +40,12 @@ func New(model string, timeout time.Duration) *Router {
 	return &Router{
 		model:   model,
 		timeout: timeout,
+		mkCls:   func() classifier { return newClassifier(model) },
 	}
 }
 
 func (r *Router) classifier() classifier {
-	r.clsOnce.Do(func() { r.cls = newClassifier(r.model) })
+	r.clsOnce.Do(func() { r.cls = r.mkCls() })
 	return r.cls
 }
 
